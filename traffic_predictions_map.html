@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <script>L_NO_TOUCH = false; L_DISABLE_3D = false;</script>
+    <style>html, body {width: 100%; height: 100%; margin: 0; padding: 0;}</style>
+    <style>#map {position: absolute; top: 50px; bottom: 0; right: 0; left: 0;}</style>
+    <style>#controls {position: absolute; top: 10px; left: 10px; z-index: 1000; background: white; padding: 10px; border-radius: 5px;}</style>
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+</head>
+<body>
+    <div id="controls">
+        <label for="minutes">Predict traffic in:</label>
+        <select id="minutes" onchange="updateMap()">
+            <option value="10">10 minutes</option>
+            <option value="20">20 minutes</option>
+            <option value="30">30 minutes</option>
+            <option value="60">60 minutes</option>
+        </select>
+    </div>
+    <div class="folium-map" id="map"></div>
+
+<script>
+    var map = L.map('map', {
+        center: [16.066145000000002, 108.209803],
+        zoom: 14,
+        zoomControl: true,
+        preferCanvas: false
+    });
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        minZoom: 0,
+        maxZoom: 19,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    var markers = [];
+
+    function updateMap() {
+        var minutes = $('#minutes').val();
+        $.ajax({
+            url: '/predict',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({minutes: minutes}),
+            success: function(data) {
+                markers.forEach(marker => map.removeLayer(marker));
+                markers = [];
+
+                data.forEach(item => {
+                    var speedMarker = L.circleMarker([item.latitude, item.longitude], {
+                        color: item.speed_color,
+                        fill: true,
+                        fillColor: item.speed_color,
+                        fillOpacity: 0.7,
+                        radius: 15
+                    }).addTo(map)
+                    .bindPopup(item.popup, {autoClose: false, closeOnClick: false})
+                    .openPopup();
+                    
+                    var densityMarker = L.circleMarker([item.latitude, item.longitude], {
+                        color: item.density_color,
+                        fill: true,
+                        fillColor: item.density_color,
+                        fillOpacity: 0.9,
+                        radius: 7
+                    }).addTo(map);
+                    
+                    markers.push(speedMarker, densityMarker);
+                });
+            },
+            error: function(xhr, status, error) {
+                console.error("Error fetching prediction data:", error);
+            }
+        });
+    }
+
+    $(document).ready(function() {
+        updateMap();
+    });
+</script>
+</body>
+</html>
