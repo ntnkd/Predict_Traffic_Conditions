@@ -2,31 +2,40 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import GRU, LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import ReduceLROnPlateau
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2
 from flask import Flask, request, jsonify, render_template_string
+from flask_socketio import SocketIO, emit
+import threading
+import time
 import os
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+from collector import TomTomTrafficCollector
 
 class TrafficPredictor:
-    def __init__(self, data_path, model_path=None):
-        """Khởi tạo TrafficPredictor với dữ liệu và mô hình (nếu có)."""
-        self.data_path = data_path
+    def __init__(self, initial_data_path, model_path=None):
+        # Khởi tạo với đường dẫn dữ liệu ban đầu và mô hình đã lưu (nếu có)
         self.scaler = MinMaxScaler()
-        self.sequence_length = 6
+        self.sequence_length = 12
         self.features = ['speed', 'vehicle_density', 'time_of_day', 'day_of_week']
         self.speed_thresholds = {'very_slow': 20, 'slow': 40, 'moderate': 60, 'fast': float('inf')}
         self.density_thresholds = {'low': 30, 'medium': 60, 'high': float('inf')}
-        self.original_data = pd.read_csv(data_path)
+        self.data_path = initial_data_path
+        self.original_data = pd.read_csv(initial_data_path)
         self.model = tf.keras.models.load_model(model_path) if model_path and os.path.exists(model_path) else None
         self.load_and_preprocess_data()
+        self.realtime_data = pd.DataFrame()
 
     def load_and_preprocess_data(self):
-        """Tiền xử lý dữ liệu: đọc CSV, chuẩn hóa, chia thành tập huấn luyện và kiểm tra."""
-        df = pd.read_csv(self.data_path)
+        # Tiền xử lý dữ liệu ban đầu: đọc CSV, chuẩn hóa, chia tập huấn luyện và kiểm tra
+        df = self.original_data.copy()
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values(['location_name', 'timestamp'])
         self.locations = df['location_name'].unique()
@@ -48,131 +57,69 @@ class TrafficPredictor:
                 'y_train': y[:train_size], 'y_test': y[train_size:],
                 'raw_data': df[location_mask]
             }
-        
-        self.X_train = np.concatenate([data['X_train'] for data in self.location_data.values()])
-        self.X_test = np.concatenate([data['X_test'] for data in self.location_data.values()])
-        self.y_train = np.concatenate([data['y_train'] for data in self.location_data.values()])
-        self.y_test = np.concatenate([data['y_test'] for data in self.location_data.values()])
 
     def build_model(self):
-        """Xây dựng mô hình LSTM để dự đoán tốc độ và mật độ xe."""
+        # Xây dựng mô hình LSTM để dự đoán tốc độ và mật độ
         self.model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(self.sequence_length, len(self.features))),
+            LSTM(32, return_sequences=True, input_shape=(self.sequence_length, len(self.features))),
             Dropout(0.3),
-            LSTM(32),
+            LSTM(16),
             Dropout(0.3),
-            Dense(16, activation='relu'),
+            Dense(8, activation='relu', kernel_regularizer=l2(0.01)),
             Dense(2)
         ])
-        # Tối ưu hóa learning rate với Adam
         optimizer = Adam(learning_rate=0.0005)
         self.model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
 
-    def train_model(self, epochs=400, batch_size=32):
-        """Huấn luyện mô hình LSTM."""
+    def train_model(self, epochs=200, batch_size=32):
+        # Huấn luyện mô hình LSTM với dữ liệu ban đầu
         if not self.model:
             self.build_model()
-
-        # Thêm Early Stopping
-        early_stopping = EarlyStopping(
-            monitor='val_loss',  # Theo dõi validation loss
-            patience=20,         # Dừng nếu không cải thiện sau 20 epoch
-            restore_best_weights=True  # Khôi phục trọng số tốt nhất
-        )
-
+        early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
+        X_train = np.concatenate([data['X_train'] for data in self.location_data.values()])
+        y_train = np.concatenate([data['y_train'] for data in self.location_data.values()])
         history = self.model.fit(
-            self.X_train, self.y_train,
+            X_train, y_train,
             epochs=epochs,
             batch_size=batch_size,
             validation_split=0.2,
-            callbacks=[early_stopping],  # Áp dụng Early Stopping
+            callbacks=[early_stopping, reduce_lr],
             verbose=1
         )
-
-        self.model.save('traffic_model.keras')
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.legend()
+        plt.savefig("loss_plot.png")
         return history
 
-    def evaluate_model(self):
-        """Đánh giá và so sánh mô hình LSTM với Linear Regression."""
-        # Dự đoán từ mô hình LSTM
-        y_pred_scaled_lstm = self.model.predict(self.X_test, verbose=0)
-        
-        # Chuyển đổi ngược lại từ dữ liệu chuẩn hóa về giá trị thực
-        y_test_full = np.concatenate([self.y_test, np.zeros((len(self.y_test), 2))], axis=1)
-        y_pred_full_lstm = np.concatenate([y_pred_scaled_lstm, np.zeros((len(y_pred_scaled_lstm), 2))], axis=1)
-        
-        y_test_real = self.scaler.inverse_transform(y_test_full)[:, :2]
-        y_pred_real_lstm = self.scaler.inverse_transform(y_pred_full_lstm)[:, :2]
+    def update_realtime_data(self, new_data: pd.DataFrame):
+        # Cập nhật dữ liệu thời gian thực và lưu vào file CSV, không giới hạn số bản ghi
+        if not new_data.empty:
+            self.realtime_data = pd.concat([self.realtime_data, new_data], ignore_index=True)
+            
+            # Ghi dữ liệu mới vào file temp_traffic_data.csv
+            if os.path.exists(self.data_path):
+                existing_data = pd.read_csv(self.data_path)
+                updated_data = pd.concat([existing_data, new_data], ignore_index=True)
+                if len(updated_data) > 10000:
+                    updated_data = updated_data.iloc[-10000:]
+                updated_data.to_csv(self.data_path, index=False)
+            else:
+                new_data.to_csv(self.data_path, index=False)
 
-        # Chuẩn bị dữ liệu cho Linear Regression (chuyển từ 3D sang 2D)
-        X_test_2d = self.X_test.reshape(self.X_test.shape[0], -1)  # (samples, sequence_length * features)
-        y_test_speed = y_test_real[:, 0]  # Tốc độ
-        y_test_density = y_test_real[:, 1]  # Mật độ
+            # Cập nhật dữ liệu trong bộ nhớ cho từng vị trí
+            for location in self.locations:
+                location_mask = self.realtime_data['location_name'] == location
+                self.location_data[location]['raw_data'] = pd.concat(
+                    [self.location_data[location]['raw_data'], self.realtime_data[location_mask]]
+                )
 
-        # Huấn luyện và dự đoán với Linear Regression
-        lr_speed = LinearRegression()
-        lr_density = LinearRegression()
-        
-        lr_speed.fit(X_test_2d, y_test_speed)
-        lr_density.fit(X_test_2d, y_test_density)
-        
-        y_pred_speed_lr = lr_speed.predict(X_test_2d)
-        y_pred_density_lr = lr_density.predict(X_test_2d)
-
-        # Tính toán các chỉ số đánh giá cho LSTM
-        mae_speed_lstm = mean_absolute_error(y_test_speed, y_pred_real_lstm[:, 0])
-        mse_speed_lstm = mean_squared_error(y_test_speed, y_pred_real_lstm[:, 0])
-        rmse_speed_lstm = np.sqrt(mse_speed_lstm)
-        
-        mae_density_lstm = mean_absolute_error(y_test_density, y_pred_real_lstm[:, 1])
-        mse_density_lstm = mean_squared_error(y_test_density, y_pred_real_lstm[:, 1])
-        rmse_density_lstm = np.sqrt(mse_density_lstm)
-
-        # Tính toán các chỉ số đánh giá cho Linear Regression
-        mae_speed_lr = mean_absolute_error(y_test_speed, y_pred_speed_lr)
-        mse_speed_lr = mean_squared_error(y_test_speed, y_pred_speed_lr)
-        rmse_speed_lr = np.sqrt(mse_speed_lr)
-        
-        mae_density_lr = mean_absolute_error(y_test_density, y_pred_density_lr)
-        mse_density_lr = mean_squared_error(y_test_density, y_pred_density_lr)
-        rmse_density_lr = np.sqrt(mse_density_lr)
-
-        # Tạo bảng so sánh
-        comparison_data = {
-            'Metric': ['MAE', 'MSE', 'RMSE'],
-            'LSTM_Speed': [mae_speed_lstm, mse_speed_lstm, rmse_speed_lstm],
-            'LR_Speed': [mae_speed_lr, mse_speed_lr, rmse_speed_lr],
-            'LSTM_Density': [mae_density_lstm, mse_density_lstm, rmse_density_lstm],
-            'LR_Density': [mae_density_lr, mse_density_lr, rmse_density_lr]
-        }
-        
-        comparison_df = pd.DataFrame(comparison_data)
-        comparison_df = comparison_df.round(2)  # Làm tròn đến 2 chữ số thập phân
-        
-        # In bảng so sánh
-        print("\nModel Comparison Table:")
-        print(comparison_df.to_string(index=False))
-        
-        # Trả về kết quả đánh giá dưới dạng dictionary nếu cần
-        evaluation_results = {
-            'LSTM': {
-                'speed': {'MAE': mae_speed_lstm, 'MSE': mse_speed_lstm, 'RMSE': rmse_speed_lstm},
-                'density': {'MAE': mae_density_lstm, 'MSE': mse_density_lstm, 'RMSE': rmse_density_lstm}
-            },
-            'LinearRegression': {
-                'speed': {'MAE': mae_speed_lr, 'MSE': mse_speed_lr, 'RMSE': rmse_speed_lr},
-                'density': {'MAE': mae_density_lr, 'MSE': mse_density_lr, 'RMSE': rmse_density_lr}
-            }
-        }
-        
-        return evaluation_results
-
-    def predict_future(self, location, minutes_ahead=10):
-        """Dự đoán tốc độ và mật độ xe trong tương lai cho một vị trí."""
+    def predict_realtime(self, location, minutes_ahead=10):
+        # Dự đoán tốc độ và mật độ trong tương lai cho một vị trí
         location_data = self.location_data[location]
         latest_sequence = location_data['raw_data'].iloc[-self.sequence_length:][self.features]
         
-        # Đảm bảo latest_sequence là DataFrame với tên cột
         latest_sequence_df = pd.DataFrame(latest_sequence, columns=self.features)
         scaled_sequence = self.scaler.transform(latest_sequence_df)
         
@@ -182,60 +129,138 @@ class TrafficPredictor:
         current_input = scaled_sequence[np.newaxis, :, :]
         predictions = []
         
-        # Lấy thời gian ban đầu để cập nhật
         last_time = pd.to_datetime(location_data['raw_data'].iloc[-1]['timestamp'])
         
         for step in range(prediction_steps):
             pred = self.model.predict(current_input, verbose=0)
             predictions.append(pred[0])
             
-            # Tạo đầu vào mới
             new_input = np.zeros((1, self.sequence_length, len(self.features)))
             new_input[0, :-1] = current_input[0, 1:]
-            
-            # Đảm bảo pred trong khoảng hợp lý
             pred_adjusted = np.clip(pred[0], 0, 1)
-            
-            # Cập nhật tốc độ và mật độ
             new_input[0, -1, :2] = pred_adjusted
             
-            # Cập nhật thời gian
             new_time = last_time + pd.Timedelta(minutes=5 * (step + 1))
             new_time_of_day = new_time.hour + new_time.minute / 60
             new_day_of_week = new_time.weekday()
             
-            # Tạo DataFrame cho thời gian mới để transform
-            time_features_df = pd.DataFrame([[0, 0, new_time_of_day, new_day_of_week]], 
-                                        columns=self.features)
+            time_features_df = pd.DataFrame([[0, 0, new_time_of_day, new_day_of_week]], columns=self.features)
             time_features = self.scaler.transform(time_features_df)[0, 2:]
             new_input[0, -1, 2:] = time_features
             
             current_input = new_input
         
         predictions = np.array(predictions)
-        # Chuyển predictions thành DataFrame trước khi inverse_transform
-        full_predictions_df = pd.DataFrame(np.concatenate([predictions, np.zeros((len(predictions), 2))], axis=1),
-                                        columns=self.features)
+        full_predictions_df = pd.DataFrame(np.concatenate([predictions, np.zeros((len(predictions), 2))], axis=1), columns=self.features)
         predictions_inv = self.scaler.inverse_transform(full_predictions_df)[:, :2]
-        
-        # Đảm bảo mật độ trong khoảng 0-100%
         predictions_inv[:, 1] = np.clip(predictions_inv[:, 1], 0, 100)
         
         return predictions_inv[-1]
 
+    def evaluate_model(self):
+        # Lấy dữ liệu kiểm tra từ tất cả các vị trí
+        X_test = np.concatenate([data['X_test'] for data in self.location_data.values()])
+        y_test = np.concatenate([data['y_test'] for data in self.location_data.values()])
+        
+        # Dự đoán bằng LSTM
+        y_pred_scaled_lstm = self.model.predict(X_test, verbose=0)
+        y_test_full = np.concatenate([y_test, np.zeros((len(y_test), 2))], axis=1)
+        y_pred_full_lstm = np.concatenate([y_pred_scaled_lstm, np.zeros((len(y_pred_scaled_lstm), 2))], axis=1)
+        
+        y_test_real = self.scaler.inverse_transform(y_test_full)[:, :2]
+        y_pred_real_lstm = self.scaler.inverse_transform(y_pred_full_lstm)[:, :2]
+        
+        # Chuẩn bị dữ liệu 3D cho LR và RF bằng cách làm phẳng mỗi chuỗi
+        num_samples = X_test.shape[0]
+        sequence_length = X_test.shape[1]  # 6
+        num_features = X_test.shape[2]     # 4
+        X_test_2d = X_test.reshape(num_samples, sequence_length * num_features)  # (samples, 24)
+        
+        y_test_speed = y_test_real[:, 0]    # Tốc độ thực tế
+        y_test_density = y_test_real[:, 1]  # Mật độ thực tế
+        
+        # Huấn luyện và dự đoán bằng Linear Regression
+        lr_speed = LinearRegression()
+        lr_density = LinearRegression()
+        lr_speed.fit(X_test_2d, y_test_speed)
+        lr_density.fit(X_test_2d, y_test_density)
+        y_pred_speed_lr = lr_speed.predict(X_test_2d)
+        y_pred_density_lr = lr_density.predict(X_test_2d)
+        
+        
+        # Huấn luyện và dự đoán bằng GRU
+        model_gru = Sequential([
+            GRU(50, activation='relu', input_shape=(X_test.shape[1], X_test.shape[2]), return_sequences=False),
+            Dense(2)
+        ])
+        model_gru.compile(optimizer='adam', loss='mse')
+        model_gru.fit(X_test, y_test, epochs=50, batch_size=32, verbose=0)
+        y_pred_gru = model_gru.predict(X_test, verbose=0)
+        y_pred_gru_real = self.scaler.inverse_transform(
+            np.concatenate([y_pred_gru, np.zeros((len(y_pred_gru), 2))], axis=1)
+        )[:, :2]
+        
+        # Tính toán các chỉ số đánh giá cho LSTM
+        mae_speed_lstm = mean_absolute_error(y_test_speed, y_pred_real_lstm[:, 0])
+        mse_speed_lstm = mean_squared_error(y_test_speed, y_pred_real_lstm[:, 0])
+        rmse_speed_lstm = np.sqrt(mse_speed_lstm)
+        
+        mae_density_lstm = mean_absolute_error(y_test_density, y_pred_real_lstm[:, 1])
+        mse_density_lstm = mean_squared_error(y_test_density, y_pred_real_lstm[:, 1])
+        rmse_density_lstm = np.sqrt(mse_density_lstm)
+        
+        # Tính toán các chỉ số đánh giá cho LR
+        mae_speed_lr = mean_absolute_error(y_test_speed, y_pred_speed_lr)
+        mse_speed_lr = mean_squared_error(y_test_speed, y_pred_speed_lr)
+        rmse_speed_lr = np.sqrt(mse_speed_lr)
+        
+        mae_density_lr = mean_absolute_error(y_test_density, y_pred_density_lr)
+        mse_density_lr = mean_squared_error(y_test_density, y_pred_density_lr)
+        rmse_density_lr = np.sqrt(mse_density_lr)
+        
+
+        
+        # Tính toán các chỉ số đánh giá cho GRU
+        mae_speed_gru = mean_absolute_error(y_test_speed, y_pred_gru_real[:, 0])
+        mse_speed_gru = mean_squared_error(y_test_speed, y_pred_gru_real[:, 0])
+        rmse_speed_gru = np.sqrt(mse_speed_gru)
+        
+        mae_density_gru = mean_absolute_error(y_test_density, y_pred_gru_real[:, 1])
+        mse_density_gru = mean_squared_error(y_test_density, y_pred_gru_real[:, 1])
+        rmse_density_gru = np.sqrt(mse_density_gru)
+        
+        # Tạo bảng so sánh
+        comparison_data = {
+            'Metric': ['MAE', 'MSE', 'RMSE'],
+            'LSTM_Speed': [mae_speed_lstm, mse_speed_lstm, rmse_speed_lstm],
+            'LR_Speed': [mae_speed_lr, mse_speed_lr, rmse_speed_lr],
+            'GRU_Speed': [mae_speed_gru, mse_speed_gru, rmse_speed_gru],
+            'LSTM_Density': [mae_density_lstm, mse_density_lstm, rmse_density_lstm],
+            'LR_Density': [mae_density_lr, mse_density_lr, rmse_density_lr],
+            'GRU_Density': [mae_density_gru, mse_density_gru, rmse_density_gru]
+        }
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        comparison_df = comparison_df.round(2)
+        
+        print("\nModel Comparison Table:")
+        print(comparison_df.to_string(index=False))
+        
+        return comparison_df
+
     def _get_speed_color(self, speed):
-        """Xác định màu sắc dựa trên tốc độ."""
+        # Trả về màu sắc dựa trên tốc độ
         if speed <= self.speed_thresholds['very_slow']:
-            return 'red'
-        elif speed <= self.speed_thresholds['slow']:
-            return 'orange'
-        elif speed <= self.speed_thresholds['moderate']:
-            return 'yellow'
-        else:
             return 'green'
+        elif speed <= self.speed_thresholds['slow']:
+            return 'yellow'
+        elif speed <= self.speed_thresholds['moderate']:
+            return 'orange'
+        else:
+            return 'red'
 
     def _get_density_color(self, density):
-        """Xác định màu sắc dựa trên mật độ xe."""
+        # Trả về màu sắc dựa trên mật độ
         if density <= self.density_thresholds['low']:
             return 'green'
         elif density <= self.density_thresholds['medium']:
@@ -244,7 +269,7 @@ class TrafficPredictor:
             return 'red'
 
     def _get_speed_category(self, speed):
-        """Xác định danh mục tốc độ."""
+        # Phân loại tốc độ thành các danh mục
         if speed <= self.speed_thresholds['very_slow']:
             return 'Very Slow'
         elif speed <= self.speed_thresholds['slow']:
@@ -255,7 +280,7 @@ class TrafficPredictor:
             return 'Fast'
 
     def _get_density_category(self, density):
-        """Xác định danh mục mật độ xe."""
+        # Phân loại mật độ thành các danh mục
         if density <= self.density_thresholds['low']:
             return 'Low'
         elif density <= self.density_thresholds['medium']:
@@ -264,8 +289,11 @@ class TrafficPredictor:
             return 'High'
 
     def create_traffic_map_data(self, minutes_ahead=10):
-        """Tạo dữ liệu bản đồ giao thông cho Leaflet."""
-        unique_locations = self.original_data.groupby('location_name').agg({
+        # Tạo dữ liệu bản đồ giao thông cho Leaflet
+        unique_locations = self.realtime_data.groupby('location_name').agg({
+            'latitude': 'first',
+            'longitude': 'first'
+        }).reset_index() if not self.realtime_data.empty else self.original_data.groupby('location_name').agg({
             'latitude': 'first',
             'longitude': 'first'
         }).reset_index()
@@ -273,7 +301,7 @@ class TrafficPredictor:
         map_data = []
         for _, row in unique_locations.iterrows():
             location = row['location_name']
-            pred = self.predict_future(location, minutes_ahead)
+            pred = self.predict_realtime(location, minutes_ahead)
             current_data = self.location_data[location]['raw_data'].iloc[-1][['speed', 'vehicle_density']].values
             
             speed_color = self._get_speed_color(pred[0])
@@ -329,38 +357,90 @@ class TrafficPredictor:
         return map_data
 
 app = Flask(__name__)
+app.static_folder = '.'
+socketio = SocketIO(app)
 
 def initialize_predictor():
-    data_path = 'temp_traffic_data.csv'
-    model_path = 'traffic_model.keras'
+    # Khởi tạo predictor, huấn luyện mô hình mới và hiển thị bảng so sánh
+    initial_data_path = 'temp_traffic_data.csv'
     
-    if not os.path.exists(model_path):
-        print(f"File mô hình '{model_path}' không tồn tại. Bắt đầu huấn luyện mô hình...")
-        predictor = TrafficPredictor(data_path)
-        predictor.train_model(epochs=400, batch_size=32)
-        print(f"Mô hình đã được huấn luyện và lưu thành '{model_path}'.")
-    else:
-        print(f"Tìm thấy file mô hình '{model_path}'. Đang nạp mô hình...")
+    print("Bắt đầu huấn luyện mô hình mới...")
+    predictor = TrafficPredictor(initial_data_path)
+    predictor.train_model(epochs=200, batch_size=32)
+    print("Mô hình đã được huấn luyện.")
     
-    predictor = TrafficPredictor(data_path, model_path)
-    # Gọi hàm đánh giá để so sánh
     predictor.evaluate_model()
     return predictor
 
 predictor = initialize_predictor()
+collector = TomTomTrafficCollector(api_key="8pAHAqpTkhGyvgvl1aWLq4nkbYGuM5Ld")
+locations = [
+    {'name': 'Dragon Bridge', 'latitude': 16.061025, 'longitude': 108.226179},
+    {'name': 'Han River Bridge', 'latitude': 16.072118, 'longitude': 108.22656},
+    {'name': 'Hue T-junction', 'latitude': 16.060478, 'longitude': 108.177008},
+    {'name': 'Da Nang station', 'latitude': 16.070959, 'longitude': 108.209465},
+]
+
+# Khởi tạo lock
+data_collection_lock = threading.Lock()
+
+def background_task():
+    thread_id = threading.get_ident()
+    print(f"Background task running in thread {thread_id}")
+    retrain_interval = 3600  # Retrain mỗi 1 giờ (3600 giây)
+    last_retrain_time = time.time()
+    min_new_records = 100  # Số bản ghi mới tối thiểu để retrain
+
+    while True:
+        with data_collection_lock:
+            realtime_data = collector.get_realtime_data(locations)
+            if not realtime_data.empty:
+                predictor.update_realtime_data(realtime_data)
+                map_data = predictor.create_traffic_map_data(minutes_ahead=10)
+                socketio.emit('traffic_update', map_data)
+
+                # Kiểm tra xem có nên huấn luyện lại mô hình không
+                current_time = time.time()
+                if (current_time - last_retrain_time >= retrain_interval) and len(predictor.realtime_data) >= min_new_records:
+                    print("Đủ dữ liệu mới, bắt đầu huấn luyện lại mô hình...")
+                    predictor.original_data = pd.read_csv(predictor.data_path)  # Cập nhật original_data từ file CSV
+                    predictor.load_and_preprocess_data()  # Cập nhật lại dữ liệu đã tiền xử lý
+                    predictor.train_model(epochs=50, batch_size=32)  # Huấn luyện với số epoch nhỏ hơn
+                    predictor.evaluate_model()
+                    print("Mô hình đã được huấn luyện lại.")
+                    last_retrain_time = current_time
+
+        time.sleep(300)  # Thu thập dữ liệu mỗi 5 phút
+
+# Biến toàn cục để theo dõi trạng thái luồng
+background_thread = None
+thread_started = False  # Thêm biến cờ để kiểm tra
+def start_background_task():
+    global background_thread, thread_started
+    if not thread_started:
+        background_thread = threading.Thread(target=background_task)
+        background_thread.daemon = True
+        background_thread.start()
+        thread_started = True
+        print("Background task started.")
+    else:
+        print("Background task is already running.")
 
 @app.route('/')
 def index():
-    """Trả về trang HTML chính với mã hóa UTF-8."""
+    # Trả về giao diện web
     with open('traffic_predictions_map.html', encoding='utf-8') as f:
         return render_template_string(f.read())
-
+    
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Xử lý yêu cầu dự đoán từ client, trả về dữ liệu bản đồ."""
+    # Xử lý yêu cầu dự đoán từ client
     minutes_ahead = int(request.json.get('minutes', 10))
     map_data = predictor.create_traffic_map_data(minutes_ahead)
     return jsonify(map_data)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Chỉ khởi động luồng trong process chính, không trong reload
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_background_task()
+    socketio.run(app, debug=True)
